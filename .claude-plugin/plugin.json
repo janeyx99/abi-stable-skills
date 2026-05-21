@@ -1,0 +1,20 @@
+{
+  "name": "abi-stable-skills",
+  "description": "Skills for migrating PyTorch C++/CUDA extensions to the stable ABI.",
+  "version": "0.1.0",
+  "author": {
+    "name": "janeyx99"
+  },
+  "skills": [
+    "./skills/"
+  ],
+  "keywords": [
+    "pytorch",
+    "libtorch",
+    "abi",
+    "stable",
+    "cpp",
+    "cuda",
+    "extensions"
+  ]
+}
