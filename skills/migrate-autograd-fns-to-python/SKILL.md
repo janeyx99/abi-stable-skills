@@ -8,7 +8,7 @@ allowed-tools: Read, Bash, Edit, Write, Grep
 
 PyTorch's stable ABI does not expose the C++ autograd machinery — `torch::autograd::Function`, `torch::autograd::AutogradContext`, `Variable`, and the associated `IValue` save/restore plumbing all live in libtorch-internal headers that fail to compile under `-DTORCH_TARGET_VERSION`. There is no `torch::stable::autograd::Function`. Writing autograd functions in Python is also the recommended path for modern C++ extensions today. Per the [official C++ custom-ops tutorial](https://docs.pytorch.org/tutorials/advanced/cpp_custom_ops.html) — is to register the autograd kernel in **Python** using `torch.library.register_autograd`, while leaving the device forward kernels (CPU, CUDA, etc.) in C++.
 
-This step is run after `pybind-to-torch-library` (so ops are registered through `TORCH_LIBRARY`) and before `split-stable-unstable` (so the C++ Autograd translation units are gone before deciding which remaining files can be made stable). It is independent of `migrate-meta-fns-to-python` — order between the two doesn't matter.
+This step is run after `pybind-to-torch-library` (so ops are registered through `TORCH_LIBRARY`) and before `scaffold-stable-target` (so the C++ Autograd translation units are gone before deciding which remaining files can be made stable). It is independent of `migrate-meta-fns-to-python` — order between the two doesn't matter.
 
 ## When to use
 
@@ -164,4 +164,4 @@ assert a.grad is not None and b.grad is not None
 
 ## Handoff
 
-The orchestrator will next dispatch `split-stable-unstable` (or `migrate-meta-fns-to-python` if it hasn't run yet — the two are independent). With C++ Autograd impls gone, the remaining C++ translation units no longer need `<torch/autograd.h>`, which expands the set of files that can be made ABI-stable.
+The orchestrator will next dispatch `scaffold-stable-target` (or `migrate-meta-fns-to-python` if it hasn't run yet — the two are independent). With C++ Autograd impls gone, the remaining C++ translation units no longer need `<torch/autograd.h>`, which expands the set of files that can be made ABI-stable.

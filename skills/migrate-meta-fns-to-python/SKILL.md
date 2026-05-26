@@ -10,7 +10,7 @@ PyTorch's stable ABI does not expose enough of the dispatcher and SymInt machine
 
 C++ Autograd impls are a parallel case handled by `migrate-autograd-fns-to-python`. The two skills are independent — order between them doesn't matter.
 
-This step is run after `pybind-to-torch-library` (so ops are registered through `TORCH_LIBRARY`) and before `split-stable-unstable` (so the C++ Meta translation units are gone before deciding which remaining files can be made stable).
+This step is run after `pybind-to-torch-library` (so ops are registered through `TORCH_LIBRARY`) and before `scaffold-stable-target` (so the C++ Meta translation units are gone before deciding which remaining files can be made stable).
 
 ## When to use
 
@@ -123,4 +123,4 @@ Expected: prints the correct shape on the meta device without crashing or runnin
 
 ## Handoff
 
-The orchestrator will next dispatch `split-stable-unstable`. With C++ Meta impls gone, the remaining C++ translation units no longer need access to the dispatcher's Meta machinery, which expands the set of files that can be made ABI-stable.
+The orchestrator will next dispatch `scaffold-stable-target`. With C++ Meta impls gone, the remaining C++ translation units no longer need access to the dispatcher's Meta machinery, which expands the set of files that can be made ABI-stable.

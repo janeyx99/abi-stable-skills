@@ -68,6 +68,49 @@ Ignore test files and any files (e.g., in an `experimental` directory) that are 
 - `<torch/library.h>`
 - `<pybind11/...>`
 
+#### 2a. Vendored / FetchContent / submodule sources are in scope if compiled into the shipped wheel
+
+A "vendored" source is any file from an external project (git submodule, CMake `FetchContent`, vendored copy under `third_party/`, `csrc/external/`, etc.) that the build system **compiles into the shipped shared library**. From the resulting `.so`'s perspective, vendored code is indistinguishable from first-party code — both contribute symbols and both must be ABI-stable.
+
+To find them, read the build files (`CMakeLists.txt`, `setup.py`, sub-CMakeLists includes) and look for:
+- CMake variables resolved to `${repo-foo_SOURCE_DIR}/.../*.cu` listed in `SOURCES` / `add_library(...)` / `Python_add_library(...)`.
+- `file(GLOB ... ${repo-foo_SOURCE_DIR}/...)` patterns that pick up many vendored files at once.
+- `add_subdirectory(${repo-foo_SOURCE_DIR} ...)` that builds the vendored project as a static lib linked into the wheel.
+- `setup.py` extensions whose `sources=[...]` list includes paths outside `csrc/`.
+
+For each vendored source compiled into the wheel:
+- If the files are checked out locally (e.g. `build/_deps/repo-foo-src/...` exists, or under `third_party/`), grep them the same way as first-party sources for the concerns in Step 3 and the gaps in Step 4. Add them to the `files` list with a `vendored: true` marker and the upstream repo URL + pinned commit/tag.
+- **If they are not checked out locally** (`build/_deps/` empty, no `third_party/` copy) and you cannot fetch them (no network access to GitHub, no permission to run `cmake configure` to populate `_deps`), surface this as a **blocker** of type `vendored-source-unfetched`. Record the file list (with `${repo-foo}` placeholders), the upstream repo+tag from `FetchContent_Declare`, and the reason. Do NOT silently drop them — the wheel cannot ship as ABI-stable until they are migrated too.
+
+Remediation options to suggest with each `vendored-source-unfetched` blocker:
+1. Re-run the assess skill on a host with network access after `cmake -S . -B build` populates `build/_deps/`.
+2. Upstream the migration via PRs to the vendored project (and bump the `GIT_TAG` in `FetchContent_Declare` afterwards).
+3. Fork-and-patch locally under `csrc/third_party/` with the migration applied, replacing the `FetchContent_Declare` URL.
+
+**Things that are NOT in scope even if vendored:**
+- Header-only libraries (e.g. cutlass, fmt) — no compiled `.cu`/`.cpp` from them; they only affect compile time, not the resulting symbol table.
+- Static libs that don't call libtorch (e.g. a vendored NCCL/mscclpp built via `add_subdirectory`). The static lib gets linked into the wheel but its own source doesn't touch the unstable libtorch ABI. **Verify** by checking the vendored project's source for `torch::`/`at::`/`c10::` — if absent, it's fine; if present, it's in scope after all.
+- Python-only artifacts installed via CMake `install(DIRECTORY ...)` (e.g. a vendored Triton kernel directory). No C++ compilation, no migration.
+
+#### 2b. Cross-backend / multi-wheel projects
+
+Many projects ship multiple wheels from the same source tree — typically a CUDA wheel plus alternate-accelerator wheels (CPU, ROCm, MUSA/Moore Threads, XPU, Metal). Look for sibling build files like `pyproject_cpu.toml`, `pyproject_rocm.toml`, `pyproject_musa.toml`, `setup_metal.py`, or `csrc/cpu/CMakeLists.txt`. Each one usually produces a separately-named wheel (e.g. `sglang-kernel-cpu`).
+
+For each alternate wheel:
+- Note its `[build-system].requires` torch pin (it may differ from the main CUDA wheel's pin — e.g. CPU pinned to `torch==2.9.0` while CUDA uses `>=2.8.0`).
+- Identify the **headers and source files it shares** with the in-scope wheel. Look for:
+  - `target_include_directories(... ../../include)` or equivalent — the alt-wheel sees the same shared header files.
+  - Headers like `sgl_kernel_ops.h` that declare function signatures with `at::Tensor`/`TORCH_CHECK`/`c10::optional` and are `#include`d by both the in-scope binder (`common_extension.cc`) and the alt-arch binders (`common_extension_musa.cc`, `common_extension_rocm.cc`).
+  - Shared utility headers (`utils.h`, `scalar_type.hpp`).
+- Surface the sharing as a **`shared-header-cross-backend` blocker** for the in-scope wheel if a naive migration would force the alt-wheels to move too. Migrating a shared header's `at::Tensor` to `torch::stable::Tensor` cascades into every `#include`r.
+
+Remediation options to suggest with each `shared-header-cross-backend` blocker:
+- **Plan A — migrate all wheels together.** Includes alt-arch in the same PR. Safest semantics, biggest scope.
+- **Plan B (usually preferred) — split the shared header per-backend.** Create `..._unstable.h` (used by alt-arch backends staying on libtorch) and `..._stable.h` (used by the migrated wheel). Lets the in-scope wheel ship ABI-stable while alt-arches catch up.
+- **Plan C — conditionalize the shared header on a macro** like `#ifdef PROJECT_USE_STABLE_ABI`. Lightest touch but increases header complexity.
+
+Record the cross-backend findings in a top-level `cross_backend_analysis` section of the plan JSON: for each alt-wheel, list its torch pin, the headers it shares with the in-scope wheel, whether it's in scope for *this* run, and a one-line note about its migration prospects (e.g. "MUSA depends on torch_musa fork's stable-ABI support — gates this wheel"). This lets the user decide whether to migrate the wheels in one shot or as a sequence.`
+
 ### 3. Detect migration concerns per file
 
 For each source file, record which of the following apply (these drive sub-skill dispatch):
@@ -79,7 +122,7 @@ For each source file, record which of the following apply (these drive sub-skill
 | C++ autograd impls | `migrate-autograd-fns-to-python` | `TORCH_LIBRARY_IMPL(..., Autograd, m)` / `..., AutogradCUDA, m)`, C++ `torch::autograd::Function` subclasses registered for the op |
 | Unstable API usage | `migrate-to-stable-apis` | Any `at::Tensor`, `TORCH_CHECK`, `c10::cuda::CUDAGuard`, `at::empty`, `TORCH_LIBRARY_IMPL`, etc. |
 
-The `split-stable-unstable` subskill is dispatched separately based on the project size, specifically the **count** of source files that require migration (see Step 7 below).
+The `scaffold-stable-target` subskill is dispatched only for **incremental** migrations. See Step 7 for the cadence decision; one-shot migrations skip it and `migrate-to-stable-apis` converts the existing extension in place.
 
 ### 4. Detect stable-ABI coverage gaps
 
@@ -203,20 +246,20 @@ Note whether the project already uses:
 
 Grep for `@torch.library.register_fake(` and `torch.library.impl(..., "Meta")`. Record any ops that **already** have a Python fake — these don't need `migrate-meta-fns-to-python` even if a corresponding C++ Meta impl exists (the C++ one becomes redundant and gets deleted).
 
-### 7. Count translation units → decide on `split-stable-unstable`
+### 7. Decide migration cadence → whether to include `scaffold-stable-target`
 
-Count the C++/CUDA source files in scope from Step 2. Form a recommendation:
+Two valid shapes:
 
-- **≥ 10 files** → recommend including `split-stable-unstable` (run migration into a parallel stable target).
-- **< 10 files** → recommend skipping it; `migrate-to-stable-apis` rewrites in place.
+- **Incremental** (run `scaffold-stable-target`). A parallel stable `ext_modules` entry sits alongside the legacy one and grows file-by-file. The legacy target keeps building and serving un-migrated ops throughout. Best when the migration will land over multiple commits/PRs, or when CI gating requires a green tree between every file change.
+- **One-shot** (skip `scaffold-stable-target`). `migrate-to-stable-apis` converts the single existing extension in place: adds `TORCH_TARGET_VERSION` to its flags, rewrites every in-scope file's APIs + registration macros, and the project ships the stable wheel directly. Best when the migration is small enough to validate as a single change — typically only a handful of translation units.
 
-The threshold isn't strict — bump it down if the project is unusually complex (custom build system, many shared headers, intricate setup.py), or bump it up for trivially structured projects. The right framing is: "is the per-file move + parallel-target overhead worth it vs. just rewriting in place?"
+The threshold isn't strict. Use the count from Step 2 as a starting heuristic — roughly < ~5 TUs leans one-shot, more leans incremental — but the real question is "will the user land this as one change or many?"
 
-**Confirm with the user before recording the decision.** Surface the count, the recommendation, and the reasoning, e.g.:
+**Ask the user before recording the decision:**
 
-> "Found 14 translation units to migrate. Recommend including `split-stable-unstable` (set up a parallel stable build target, migrate files into it one at a time). Alternative: skip it and rewrite in place — bulkier for a project this size, but faster. Which do you want?"
+> "Found `<N>` translation units to migrate. Do you want to land this as: (a) one-shot — convert the existing extension in place, single PR; or (b) incremental — set up a parallel stable target and migrate file-by-file across multiple PRs, with the legacy target staying green throughout? Recommendation for `<N>` files: `<one-shot | incremental>`."
 
-Only after the user confirms (or overrides), record the decision in the plan's `dispatch_order`. Save the user's choice + reasoning to the plan so future re-runs don't re-prompt unnecessarily.
+Record the choice. If **incremental**, include `scaffold-stable-target` in `dispatch_order` (before `migrate-to-stable-apis`). If **one-shot**, omit it. Save the user's choice and reasoning so re-runs don't re-prompt.
 
 ### 8. Detect test setup
 
@@ -288,10 +331,38 @@ Source of truth for the migration. Schema:
     "pybind-to-torch-library",
     "migrate-meta-fns-to-python",
     "migrate-autograd-fns-to-python",
-    "split-stable-unstable",
+    "scaffold-stable-target",   // omitted for one-shot migrations (Step 7)
     "migrate-to-stable-apis"
   ],
-  "blockers": []
+  "migration_cadence": "incremental",   // or "one-shot" — recorded from Step 7
+  "migration_cadence_reason": "<user's stated reason or assess's recommendation>",
+  "cross_backend_analysis": {
+    "wheels": {
+      "<wheel name> (e.g., sglang-kernel-cpu)": {
+        "torch_pin": "<from pyproject_*.toml>",
+        "shares_with_in_scope_wheel": ["include/foo.h", "..."],
+        "in_scope_for_this_assessment": false,
+        "note": "<one-line summary of migration prospects / gating factors>"
+      }
+    },
+    "recommendation": "<which plan from the shared-header blocker; rationale>"
+  },
+  "blockers": [
+    {
+      "type": "vendored-source-unfetched",
+      "scope": "<which built target / wheel>",
+      "files": ["${repo-foo}/path/to/file.cu", "..."],
+      "reason": "<what we know without grepping; why it's a blocker>",
+      "remediation_options": ["fetch + re-run", "upstream PR", "fork-and-patch"]
+    },
+    {
+      "type": "shared-header-cross-backend",
+      "scope": "include/foo.h",
+      "files": ["include/foo.h", "..."],
+      "reason": "<which alt-arch binders #include this header; what cascades>",
+      "remediation_options": ["Plan A — migrate all together", "Plan B — split per-backend", "Plan C — conditional macro"]
+    }
+  ]
 }
 ```
 
@@ -304,7 +375,8 @@ Print a short markdown summary to the user:
 - Build torch version: `<build_torch_version>` (must match installed).
 - Target torch version (`TORCH_TARGET_VERSION`): `<target_torch_version>`. Resulting wheel will require this version or newer at runtime.
 - Migrateable: yes / yes-with-workarounds / no (with reason).
-- Files in scope: count.
+- Files in scope: count (broken down: first-party / vendored-fetched / vendored-unfetched).
+- Cross-backend wheel summary (if alt-arch wheels exist): one bullet per alt-wheel with torch pin + shared headers + the chosen Plan A/B/C.
 - Sub-skills that are recommended (in order).
 - Coverage gaps requiring workarounds, with closure analysis:
   - "Bumping target to 2.12 would close 1 of 5 gaps."

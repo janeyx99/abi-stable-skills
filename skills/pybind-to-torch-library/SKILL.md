@@ -225,4 +225,4 @@ After conversion:
 
 ## Handoff
 
-Marks `pybind` files as ready for downstream steps. The orchestrator will next dispatch `migrate-meta-fns-to-python` (if applicable) and then `split-stable-unstable`. `STABLE_TORCH_LIBRARY` conversion and `TORCH_TARGET_VERSION` build flag come in `migrate-to-stable-apis`.
+Marks `pybind` files as ready for downstream steps. The orchestrator will next dispatch `migrate-meta-fns-to-python` (if applicable) and then `scaffold-stable-target`. `STABLE_TORCH_LIBRARY` conversion and `TORCH_TARGET_VERSION` build flag come in `migrate-to-stable-apis`.
