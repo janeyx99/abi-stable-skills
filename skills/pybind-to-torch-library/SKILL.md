@@ -214,6 +214,7 @@ If the project still has any direct CPython API usage (rare, since pybind was th
 3. **Do not keep both pybind and `TORCH_LIBRARY` registrations for the same function** — this produces two Python entry points and confuses users.
 4. **Mutable args (`Tensor(a!)`)** — if any pybind function mutates inputs in place, that needs to be reflected in the schema with alias annotations. Don't guess; flag for the user.
 5. **Variadic / `*args` Python signatures** are not expressible in schemas. Refactor to fixed argument lists.
+6. **Change signatures only as much as the dispatcher requires; otherwise keep existing behavior.** `c10` only accepts certain C++ types, so some changes are unavoidable: native `int`→`int64_t`, `float`→`double` ("Only int8_t/int64_t/bool…", "float is not supported, use double instead" from `infer_schema.h`), and non-const-ref optional params (e.g. `std::optional<at::Tensor>&`) usually need to become by-value. But do NOT churn beyond that — a read-only `const at::Tensor&` stays `const at::Tensor&` (the dispatcher accepts it), don't drop `const`, don't reorder args, don't change defaults. Minimal, behavior-preserving signature changes keep the diff reviewable and avoid subtle regressions.
 
 ## Verification
 

@@ -241,33 +241,39 @@ These are mistakes that AI-assisted migrations commonly make — follow strictly
 4. **Do NOT forward-declare `aoti_torch_get_current_cuda_stream`** — include it from `torch/csrc/inductor/aoti_torch/c/shim.h`.
 5. **Do NOT hand-write boxed kernels** — use `TORCH_BOX(&fn)` in `m.impl()`.
 6. **Do NOT change switch statements into if/else** as part of the migration. The stable ABI works fine with switch statements; rewriting just adds review noise.
-7. **When replacing `TORCH_CHECK` with `STD_TORCH_CHECK`, change only the macro name** — leave the condition and message arguments untouched.
-8. **For `DeviceGuard`**, pass `t.get_device_index()` (an integer), **not** `t.device()`. Do not cast to `char` or narrow type. DeviceGuard is RAII — don't move its declaration into an inner scope.
-9. **For CUDA streams**, derive the device index from a tensor (`t.get_device_index()`), **not** from `torch::stable::accelerator::getCurrentDeviceIndex()`. Multi-GPU scenarios silently produce the wrong stream otherwise.
-10. **Scalar type enums use the headeronly form** — `torch::headeronly::ScalarType::Float` (not `torch::kFloat32`), `::Half` (not `torch::kFloat16`), `::BFloat16`, `::Float8_e4m3fn`, etc.
+7. **Preserve existing behavior and signatures — change ONLY what the migration strictly requires.** Swap the types the ABI needs (`at::Tensor`→`torch::stable::Tensor`, the macros, etc.) and nothing else. Do NOT add or drop `const`, switch a parameter between by-value and by-reference, reorder arguments, or change defaults. Gratuitous signature churn adds review noise, can subtly change behavior, and makes the migration commit hard to audit against the previous one.
+8. **When replacing `TORCH_CHECK` with `STD_TORCH_CHECK`, change only the macro name** — leave the condition and message arguments untouched.
+9. **For `DeviceGuard`**, pass `t.get_device_index()` (an integer), **not** `t.device()`. Do not cast to `char` or narrow type. DeviceGuard is RAII — don't move its declaration into an inner scope.
+10. **For CUDA streams**, derive the device index from a tensor (`t.get_device_index()`), **not** from `torch::stable::accelerator::getCurrentDeviceIndex()`. Multi-GPU scenarios silently produce the wrong stream otherwise.
+11. **Scalar type enums use the headeronly form** — `torch::headeronly::ScalarType::Float` (not `torch::kFloat32`), `::Half` (not `torch::kFloat16`), `::BFloat16`, `::Float8_e4m3fn`, etc.
 
 ## Verification
 
-Build with `build_cmd`. Run the project's existing tests with `test_cmd`. Then prove ABI stability empirically:
+Build with `build_cmd`, then audit the built `.so` directly — this catches unstable symbols a passing test suite would miss:
 
 ```bash
-# Build against torch X.Y
-pip install torch==X.Y
-<build_cmd>
-
-# Then install a different torch minor and re-test without rebuilding the extension
-pip install torch==X.Z
-<test_cmd>
+torch-abi-audit <path/to/extension.so>   # or an import name; -v lists offending symbols
 ```
 
-If the second `test_cmd` passes, the migration is verified.
+A clean report means the binary only depends on th e stable C-shim ABI. If it flags `c10::`/`at::` symbols, a legacy call slipped through — fix it before proceeding. (`pip install torch-abi-audit`.)
+
+Then run `test_cmd`, and prove cross-version ABI stability empirically:
+
+```bash
+pip install torch==X.Y && <build_cmd>   # build against one minor
+pip install torch==X.Z && <test_cmd>    # re-test against another, no rebuild
+```
+
+If the audit is clean and the second `test_cmd` passes, the migration is verified.
 
 ## Real-world references
 
 - **Official tutorial:** [Custom C++ and CUDA Operators](https://docs.pytorch.org/tutorials/advanced/cpp_custom_ops.html) — walks through the same migration end-to-end on a toy `mymuladd` op, with side-by-side ABI-stable vs non-stable tabs.
 - **API-rewrite reference:** [`pytorch/extension-cpp`](https://github.com/pytorch/extension-cpp) — contains `extension_cpp/` (legacy) and `extension_cpp_stable/` (stable) implementations of the same op. Useful as a side-by-side diff for the API changes themselves. Note its parallel-directory layout is for didactic clarity; this skill's migration model keeps both targets in one `csrc/`.
 - **Shared-namespace pattern:** [sglang's sgl-kernel](https://github.com/sgl-project/sglang/tree/main/sgl-kernel) — Python callers use `torch.ops.sgl_kernel.<op>` regardless of which `.so` implements the op. The `.so` filename is implementation detail.
-- **Real-world migration:** FlashAttention 3's [`flash_api.cpp`](https://github.com/Dao-AILab/flash-attention/blob/main/hopper/flash_api.cpp) (legacy) vs [`flash_api_stable.cpp`](https://github.com/Dao-AILab/flash-attention/blob/main/hopper/flash_api_stable.cpp) (stable). The diff is a concrete production-scale example of the API rewrite.
+- **Real-world migration:** FlashAttention 3's [`flash_api.cpp`](https://github.com/Dao-AILab/flash-attention/blob/main/hopper/flash_api.cpp) (legacy) vs [`flash_api_stable.cpp`](https://github.com/Dao-AILab/flash-attention/blob/main/hopper/flash_api_stable.cpp) (stable) — a production-scale example of the **API rewrite** (`at::` → `torch::stable::`, schema strings, `Tensor(out!)?` annotations).
+
+  ⚠️ **Don't copy FA3's op registration.** It hand-writes boxed kernels (`boxed_mha_fwd(StableIValue* stack, …)`) — you don't need to. Register with `TORCH_BOX(&fn)` (Step 3 / critical rule 5).
 - **Other adoptions:** xformers, torchaudio, torchao, vLLM (in progress).
 
 ## Handoff
